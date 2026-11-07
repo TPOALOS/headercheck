@@ -6,13 +6,14 @@ body is never read). Only use it on sites you own or are authorized to test.
 Standard library only. Exit code 0 = no HIGH/MEDIUM findings, 1 = findings, 2 = error.
 """
 import argparse
+import json
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 USER_AGENT = "headercheck/%s (security header audit by the site owner)" % __version__
 SEV = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
 PENALTY = {"HIGH": 20, "MEDIUM": 10, "LOW": 3, "INFO": 0}
@@ -56,6 +57,16 @@ def audit(headers, https=True):
             add("MEDIUM", "csp-unsafe", "CSP allows 'unsafe-inline' or 'unsafe-eval' for scripts", "use nonces or hashes instead")
         if "*" in script or "data:" in script or "http:" in script:
             add("MEDIUM", "csp-wildcard", "CSP script sources are overly broad (*, data: or http:)", "list specific https origins")
+        obj = directive(csp, "object-src")
+        effective = obj if obj is not None else directive(csp, "default-src")
+        if effective is None or [t.lower() for t in effective] != ["'none'"]:
+            add("LOW", "csp-object-src", "CSP does not set object-src 'none' (plugins and legacy content)",
+                "add `object-src 'none'`")
+        if directive(csp, "base-uri") is None:
+            add("LOW", "csp-base-uri", "CSP has no base-uri directive, so an injected <base> tag can redirect relative URLs",
+                "add `base-uri 'self'` (or 'none')")
+    if csp is None and get(headers, "content-security-policy-report-only"):
+        add("LOW", "csp-report-only", "CSP is only in Report-Only mode and is not enforced", "switch to Content-Security-Policy once the reports are clean")
     xfo = get(headers, "x-frame-options")
     if xfo is None and not (csp and directive(csp, "frame-ancestors") is not None):
         add("MEDIUM", "clickjacking", "no X-Frame-Options and no CSP frame-ancestors", "add `frame-ancestors 'none'` (or 'self') to the CSP")
@@ -66,6 +77,9 @@ def audit(headers, https=True):
         add("LOW", "referrer-missing", "no Referrer-Policy header", "add `Referrer-Policy: strict-origin-when-cross-origin`")
     elif ref.strip().lower() in ("unsafe-url", "no-referrer-when-downgrade"):
         add("LOW", "referrer-weak", "Referrer-Policy %r leaks full URLs" % ref, "use strict-origin-when-cross-origin or stricter")
+    if (get(headers, "x-xss-protection") or "").strip().startswith("1"):
+        add("LOW", "xss-protection-legacy", "X-XSS-Protection enables the legacy browser filter, which can itself introduce flaws",
+            "remove it or set `X-XSS-Protection: 0` and rely on CSP")
     if get(headers, "permissions-policy") is None:
         add("LOW", "permissions-missing", "no Permissions-Policy header", "disable features you do not use, e.g. `camera=(), microphone=()`")
     server = get(headers, "server")
@@ -74,6 +88,9 @@ def audit(headers, https=True):
     if get(headers, "x-powered-by"):
         add("LOW", "x-powered-by", "X-Powered-By reveals the technology stack", "remove the header")
     acao, acac = get(headers, "access-control-allow-origin"), get(headers, "access-control-allow-credentials")
+    if (acao or "").strip().lower() == "null":
+        add("MEDIUM", "cors-null", "CORS allows the 'null' origin, which sandboxed iframes and local files can use",
+            "do not allow the null origin")
     if acao == "*" and (acac or "").lower() == "true":
         add("HIGH", "cors-credentials", "CORS allows any origin together with credentials", "echo only trusted origins")
     for k, v in headers:
@@ -87,6 +104,9 @@ def audit(headers, https=True):
             add("LOW", "cookie-httponly", "cookie %r lacks HttpOnly" % name, "add HttpOnly unless scripts need it")
         if "samesite" not in flags:
             add("LOW", "cookie-samesite", "cookie %r lacks SameSite" % name, "add SameSite=Lax (or Strict)")
+        elif re.search(r"samesite\s*=\s*none", flags) and "secure" not in flags:
+            add("MEDIUM", "cookie-samesite-none", "cookie %r uses SameSite=None without Secure; browsers reject it" % name,
+                "add Secure, or use SameSite=Lax")
     return sorted(out, key=lambda f: SEV[f[0]])
 
 
@@ -109,15 +129,38 @@ def fetch(url, timeout=10):
         resp.close()
 
 
+def read_urls(args):
+    urls = list(args.urls)
+    if args.file:
+        with open(args.file, encoding="utf-8", errors="replace") as fh:
+            urls += [l.split("#")[0].strip() for l in fh if l.split("#")[0].strip()]
+    return urls
+
+
 def main(argv=None, fetcher=fetch):
     ap = argparse.ArgumentParser(description="Grade HTTP security headers of a site you operate.")
-    ap.add_argument("urls", nargs="+", help="https://example.com (scheme optional, defaults to https)")
+    ap.add_argument("urls", nargs="*", help="https://example.com (scheme optional, defaults to https)")
+    ap.add_argument("-f", "--file", help="file with one URL per line (# comments ok)")
     ap.add_argument("--timeout", type=int, default=10)
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--min-severity", choices=("LOW", "MEDIUM", "HIGH"), default="LOW",
+                    help="hide findings below this severity (the score still counts them)")
+    ap.add_argument("--fail-on", choices=("LOW", "MEDIUM", "HIGH"), default="MEDIUM",
+                    help="exit 1 when a finding of at least this severity exists (default MEDIUM)")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
+    try:
+        urls = read_urls(args)
+    except OSError as exc:
+        print("headercheck: %s" % exc, file=sys.stderr)
+        return 2
+    if not urls:
+        ap.print_usage(sys.stderr)
+        return 2
     print("Only scan sites you own or are authorized to test.", file=sys.stderr)
-    bad = False
-    for raw in args.urls:
+    shown, fail_at = SEV[args.min_severity], SEV[args.fail_on]
+    bad, results = False, []
+    for raw in urls:
         url = raw if "://" in raw else "https://" + raw
         if urllib.parse.urlparse(url).scheme not in ("http", "https"):
             print("headercheck: unsupported URL scheme: %s" % raw, file=sys.stderr)
@@ -129,12 +172,18 @@ def main(argv=None, fetcher=fetch):
             return 2
         findings = audit(headers, urllib.parse.urlparse(final).scheme == "https")
         pts, grade = score(findings)
-        print("== %s -> %s (HTTP %s)  score %d/100  grade %s" % (raw, final, status, pts, grade))
-        for sev, rule, msg, fix in findings:
-            print("%-6s %-20s %s%s" % (sev, rule, msg, "\n         fix: " + fix if fix else ""))
-        bad = bad or any(f[0] in ("HIGH", "MEDIUM") for f in findings)
+        results.append({"url": raw, "final_url": final, "status": status, "score": pts, "grade": grade,
+                        "findings": [{"severity": sv, "rule": r, "message": m, "fix": f}
+                                     for sv, r, m, f in findings if SEV[sv] <= shown]})
+        bad = bad or any(SEV[f[0]] <= fail_at for f in findings)
+        if not args.json:
+            print("== %s -> %s (HTTP %s)  score %d/100  grade %s" % (raw, final, status, pts, grade))
+            for sev, rule, msg, fix in findings:
+                if SEV[sev] <= shown:
+                    print("%-6s %-20s %s%s" % (sev, rule, msg, "\n         fix: " + fix if fix else ""))
+    if args.json:
+        print(json.dumps(results, indent=2))
     return 1 if bad else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

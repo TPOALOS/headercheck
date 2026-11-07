@@ -12,7 +12,13 @@ prints a score, a grade and a fix for each problem. One file, standard library o
 ```bash
 python3 headercheck.py example.com
 python3 headercheck.py https://staging.example.org https://www.example.org --timeout 5
+python3 headercheck.py -f my-sites.txt --json                 # one URL per line, # comments ok
+python3 headercheck.py example.com --fail-on LOW --min-severity MEDIUM
+# or: pip install git+https://github.com/TPOALOS/headercheck && headercheck example.com
 ```
+
+`--fail-on` sets the severity that makes the exit code `1` (default `MEDIUM`); `--min-severity` only hides lower findings
+from the output, the score still counts them.
 
 Example output:
 
@@ -31,11 +37,12 @@ LOW    referrer-missing     no Referrer-Policy header
 | Area | Rules |
 |------|-------|
 | Transport | `no-https` (HIGH), `hsts-missing` (MEDIUM), `hsts-short` (LOW) |
-| Content-Security-Policy | `csp-missing`, `csp-unsafe` (`'unsafe-inline'`/`'unsafe-eval'`), `csp-wildcard` (`*`, `data:`, `http:`), `clickjacking` (no `frame-ancestors` and no `X-Frame-Options`), all MEDIUM |
+| Content-Security-Policy | `csp-missing`, `csp-unsafe` (`'unsafe-inline'`/`'unsafe-eval'`), `csp-wildcard` (`*`, `data:`, `http:`), `clickjacking` (no `frame-ancestors` and no `X-Frame-Options`), all MEDIUM; `csp-object-src`, `csp-base-uri`, `csp-report-only` (LOW) |
 | Hardening headers | `nosniff-missing`, `referrer-missing`, `referrer-weak`, `permissions-missing` (LOW) |
 | Information leaks | `server-version`, `x-powered-by` (LOW) |
-| CORS | `cors-credentials`: `*` together with credentials (HIGH) |
-| Cookies | `cookie-secure` (MEDIUM), `cookie-httponly`, `cookie-samesite` (LOW), checked for every `Set-Cookie` |
+| CORS | `cors-credentials`: `*` together with credentials (HIGH); `cors-null`: the `null` origin is allowed (MEDIUM) |
+| Cookies | `cookie-secure`, `cookie-samesite-none` (MEDIUM), `cookie-httponly`, `cookie-samesite` (LOW), checked for every `Set-Cookie` |
+| Legacy | `xss-protection-legacy`: `X-XSS-Protection: 1` (LOW) |
 
 Score starts at 100 and loses 20 per HIGH, 10 per MEDIUM, 3 per LOW finding
 (A 90+, B 75+, C 60+, D 40+, F below).
